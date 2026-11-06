@@ -1,0 +1,161 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Find the project (uses the newest zip if you uploaded one)
+        id: find
+        shell: bash
+        run: |
+          Z=$(ls -1 -- *.zip 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$Z" ]; then
+            echo "Using $Z"
+            rm -rf unzipped_project
+            unzip -oq "$Z" -d unzipped_project
+            S=$(find unzipped_project -name settings.gradle.kts -print -quit)
+          else
+            S=$(find . -name settings.gradle.kts -not -path './.git/*' -print -quit)
+          fi
+          if [ -z "$S" ]; then
+            echo "Files in the repo:"; ls -la
+            echo "::error title=Project files are missing::settings.gradle.kts was not found. Upload the project zip to the main page of this repo, then run again."
+            exit 1
+          fi
+          echo "Project folder: $(dirname "$S")"
+          echo "dir=$(dirname "$S")" >> "$GITHUB_OUTPUT"
+
+      - name: Check Supabase settings
+        shell: bash
+        env:
+          # Reads a repository SECRET, or a repository VARIABLE with the same name.
+          RAW_URL: ${{ secrets.SUPABASE_URL || vars.SUPABASE_URL }}
+          RAW_KEY: ${{ secrets.SUPABASE_ANON_KEY || vars.SUPABASE_ANON_KEY }}
+          RAW_DOMAIN: ${{ secrets.CUSTOMER_EMAIL_DOMAIN || vars.CUSTOMER_EMAIL_DOMAIN }}
+        run: |
+          fail() {
+            echo "::error title=$1::$2"
+            {
+              echo "### $1"
+              echo "$2"
+              echo
+              echo "**How to add them (works in a phone browser):**"
+              echo "1. Your repo > **Settings** > **Secrets and variables** > **Actions**"
+              echo "2. Tap **New repository secret**"
+              echo "3. Name = exactly \`SUPABASE_URL\` (then again for \`SUPABASE_ANON_KEY\`). Value = from Supabase > Project Settings > API"
+              echo "4. Go to **Actions** > this run > **Re-run all jobs**"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          # Keep only characters that can appear in a URL or key (drops spaces, new lines, quotes, hidden characters).
+          clean() { printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9._~:/?#@%&=+,;!*()$-'; }
+          url="$(clean "$RAW_URL")"
+          key="$(clean "$RAW_KEY")"
+          domain="$(clean "$RAW_DOMAIN")"
+          while [[ "$url" == */ ]]; do url="${url%/}"; done
+          domain="${domain#@}"
+
+          missing=""
+          [ -n "$url" ] || missing="SUPABASE_URL"
+          [ -n "$key" ] || missing="${missing:+$missing and }SUPABASE_ANON_KEY"
+          [ -z "$missing" ] || fail "Supabase secrets missing" "Missing: $missing. Add each one under Settings > Secrets and variables > Actions > New repository secret (name must match exactly), then re-run."
+
+          case "$url" in
+            https://*) ;;
+            *) fail "SUPABASE_URL must start with https://" "It should look like https://abcdxyz.supabase.co (Supabase > Project Settings > API > Project URL)." ;;
+          esac
+
+          [ "${#key}" -ge 20 ] || fail "SUPABASE_ANON_KEY looks too short" "Copy the full anon / publishable key from Supabase > Project Settings > API."
+
+          # Safety: a service_role / secret key must never be put inside an app.
+          kind=""
+          case "$key" in
+            sb_secret_*) kind="secret" ;;
+            eyJ*)
+              body="$(printf '%s' "$key" | cut -d. -f2 | tr '_-' '/+')"
+              decoded="$(printf '%s' "$body" | base64 -d 2>/dev/null || true)"
+              case "$decoded" in *service_role*) kind="service_role" ;; esac ;;
+          esac
+          [ -z "$kind" ] || fail "That key is a SECRET key - do not use it" "Never put a service_role / secret key in an app. Use the anon / publishable key instead (Supabase > Project Settings > API), then re-run."
+
+          echo "::add-mask::$key"
+          {
+            echo "SUPABASE_URL=$url"
+            echo "SUPABASE_ANON_KEY=$key"
+            echo "CUSTOMER_EMAIL_DOMAIN=$domain"
+          } >> "$GITHUB_ENV"
+          echo "Supabase settings found: URL ${#url} characters, key ${#key} characters. Email domain: ${domain:-gmail.com (default)}"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Gradle 8.7 and Android SDK 34
+        shell: bash
+        run: |
+          wget -q --tries=3 --timeout=60 -O "$RUNNER_TEMP/gradle.zip" https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$HOME"
+          echo "$HOME/gradle-8.7/bin" >> "$GITHUB_PATH"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null || true
+            "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+          fi
+
+      - name: Build the APK
+        id: build
+        shell: bash
+        working-directory: ${{ steps.find.outputs.dir }}
+        # SUPABASE_URL, SUPABASE_ANON_KEY and CUSTOMER_EMAIL_DOMAIN come from the check step above.
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Show the real errors
+        if: failure() && steps.build.conclusion == 'failure'
+        shell: bash
+        run: |
+          [ -f build.log ] || exit 0
+          grep -E "^e: |^error: |error: |Unresolved reference|What went wrong|Execution failed|Could not |FAILURE" build.log | sed -E 's#file:///[^ ]*/(app/src/[^ ]*)#\1#' | head -n 40 > errors.txt || true
+          { echo "### Build failed - send this to Claude"; echo '~~~'; cat errors.txt; echo '~~~'; } >> "$GITHUB_STEP_SUMMARY"
+          head -n 10 errors.txt | while IFS= read -r line; do echo "::error::${line:0:300}"; done
+          echo "----- last 60 log lines -----"; tail -n 60 build.log
+
+      - name: Keep a copy on the run page
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RealSupermarket-apk
+          path: ${{ steps.find.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Publish the APK on the Releases page
+        if: success()
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cp "${{ steps.find.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk" RealSupermarket.apk
+          gh release delete latest-apk --cleanup-tag --yes || true
+          gh release create latest-apk RealSupermarket.apk --title "Real Supermarket APK" --notes "Built automatically. Download RealSupermarket.apk and install it." --target "${{ github.sha }}"
+          echo "### APK ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download it: https://github.com/${{ github.repository }}/releases/tag/latest-apk" >> "$GITHUB_STEP_SUMMARY"
